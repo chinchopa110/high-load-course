@@ -1,6 +1,5 @@
 package ru.quipy.payments.logic
 
-import io.micrometer.core.instrument.Metrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -10,19 +9,23 @@ import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.PriorityBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.ceil
-
-class TooManyRequestsException(val retryAfter: Long) : RuntimeException()
 
 @Service
 class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
+        private const val QUEUE_CAPACITY = 42
+    }
+
+    private class PaymentTask(val deadline: Long, private val action: () -> Unit) : Runnable, Comparable<PaymentTask> {
+        override fun run() = action()
+        override fun compareTo(other: PaymentTask): Int = deadline.compareTo(other.deadline)
     }
 
     @Autowired
@@ -50,11 +53,9 @@ class OrderPayer {
         ceil(1000.0 / minOf(account.rateLimitPerSec.toDouble(), account.parallelRequests * 1000.0 / account.averageProcessingTime.toMillis())).toLong()
     }
 
-    private val paymentsInProgress = AtomicInteger(0).also { Metrics.gauge("payments_in_progress", it) }
+    private val paymentsInProgress = AtomicInteger(0)
 
-    private val accepted = Metrics.counter("payment_requests", "stage", "accepted")
-    private val rejected = Metrics.counter("payment_requests", "stage", "rejected")
-    private val finished = Metrics.counter("payment_requests", "stage", "finished")
+    private val queue = PriorityBlockingQueue<Runnable>(QUEUE_CAPACITY)
 
     private val paymentExecutor by lazy {
         ThreadPoolExecutor(
@@ -62,7 +63,7 @@ class OrderPayer {
             inFlight,
             0L,
             TimeUnit.MILLISECONDS,
-            LinkedBlockingQueue(8_000),
+            queue,
             NamedThreadFactory("payment-submission-executor"),
             CallerBlockingRejectedExecutionHandler()
         )
@@ -70,13 +71,10 @@ class OrderPayer {
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         if (!takePlaceIfInTime(deadline)) {
-            rejected.increment()
-            throw TooManyRequestsException(System.currentTimeMillis() + retryAfterMillis)
+            throw PaymentQueueFullException((retryAfterMillis + 999) / 1000)
         }
-        accepted.increment()
-
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
+        paymentExecutor.execute(PaymentTask(deadline) {
             try {
                 val createdEvent = paymentESService.create {
                     it.create(
@@ -90,9 +88,8 @@ class OrderPayer {
                 paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
             } finally {
                 paymentsInProgress.decrementAndGet()
-                finished.increment()
             }
-        }
+        })
         return createdAt
     }
 
