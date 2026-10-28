@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Metrics
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -39,16 +40,10 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    private var rateLimiter: SlidingWindowRateLimiter
-    private var parallelRequestsLimiter: Semaphore
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val parallelRequestsLimiter = Semaphore(parallelRequests, true)
 
-    init {
-        val parsedRateLimit = rateLimitPerSec.toLong()
-        val duration = Duration.ofSeconds(1)
-
-        rateLimiter = SlidingWindowRateLimiter(parsedRateLimit, duration)
-        parallelRequestsLimiter = Semaphore(parallelRequests, true)
-    }
+    private val outgoing = Metrics.counter("payment_requests", "stage", "outgoing")
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val acquireTimeout = deadline - now() - requestAverageProcessingTime.toMillis()
@@ -81,6 +76,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+            outgoing.increment()
 
             try {
                 val request = Request.Builder().run {
@@ -93,7 +89,7 @@ class PaymentExternalSystemAdapterImpl(
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
                         logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                     }
 
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
