@@ -66,7 +66,7 @@ class PaymentExternalSystemAdapterImpl(
         try {
             inflightLimiter.acquire()
 
-            while (!rateLimiter.tick()) { }
+            rateLimiter.tickBlocking()
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
@@ -110,6 +110,13 @@ class PaymentExternalSystemAdapterImpl(
             inflightLimiter.release()
         }
     }
+
+    override fun throughputPerMs() = minOf(
+        rateLimitPerSec / 1000.0,
+        parallelRequests.toDouble() / averageProcessingMs()
+    )
+
+    override fun averageProcessingMs() = requestAverageProcessingTime.toMillis().coerceAtLeast(1L)
 
     override fun price() = properties.price
 

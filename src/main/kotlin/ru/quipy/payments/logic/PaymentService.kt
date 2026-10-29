@@ -4,6 +4,8 @@ import java.time.Duration
 import java.util.*
 
 interface PaymentService {
+    fun capacity(remainingMs: Long, executorThreads: Int): Int
+
     /**
      * Submit payment request to some external service.
      */
@@ -17,6 +19,10 @@ interface PaymentService {
 
  */
 interface PaymentExternalSystemAdapter {
+    fun throughputPerMs(): Double
+
+    fun averageProcessingMs(): Long
+
     fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
     fun name(): String
