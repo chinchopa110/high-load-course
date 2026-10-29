@@ -1,29 +1,25 @@
 package ru.quipy.payments.logic
 
+import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import ru.quipy.apigateway.APIController.OrderStatus
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
+import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 @Service
 class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val PAYMENT_EXECUTOR_THREADS = 128
-    }
-
-    private class PaymentTask(val deadline: Long, private val action: () -> Unit) : Runnable, Comparable<PaymentTask> {
-        override fun run() = action()
-        override fun compareTo(other: PaymentTask): Int = deadline.compareTo(other.deadline)
     }
 
     @Autowired
@@ -32,52 +28,45 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val queue = PriorityBlockingQueue<Runnable>()
-    private val inFlight = AtomicInteger()
+    @Autowired
+    private lateinit var paymentMetrics: PaymentMetrics
+
+    @Autowired
+    private lateinit var orderRepository: OrderRepository
 
     private val paymentExecutor = ThreadPoolExecutor(
-        PAYMENT_EXECUTOR_THREADS,
-        PAYMENT_EXECUTOR_THREADS,
+        128,
+        128,
         0L,
         TimeUnit.MILLISECONDS,
-        queue,
-        NamedThreadFactory("payment-submission-executor")
+        LinkedBlockingQueue(8),
+        NamedThreadFactory("payment-submission-executor"),
+        ThreadPoolExecutor.AbortPolicy()
     )
 
-    private fun tryReserveSlot(deadline: Long): Boolean {
-        while (true) {
-            val current = inFlight.get()
-            val capacity = paymentService.capacity(deadline - System.currentTimeMillis(), PAYMENT_EXECUTOR_THREADS)
-            if (current >= capacity) return false
-            if (inFlight.compareAndSet(current, current + 1)) return true
-        }
+    @PostConstruct
+    fun registerMetrics() {
+        paymentMetrics.monitorQueue(paymentExecutor)
     }
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        if (!tryReserveSlot(deadline)) {
-            throw PaymentQueueFullException()
-        }
+        paymentMetrics.recordIncoming()
         val createdAt = System.currentTimeMillis()
-        try {
-            paymentExecutor.execute(PaymentTask(deadline) {
-                try {
-                    val createdEvent = paymentESService.create {
-                        it.create(
-                            paymentId,
-                            orderId,
-                            amount
-                        )
-                    }
-                    logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+        paymentExecutor.submit {
+            val order = orderRepository.findById(orderId)
+                ?: throw IllegalArgumentException("No such order $orderId")
+            orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
 
-                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-                } finally {
-                    inFlight.decrementAndGet()
-                }
-            })
-        } catch (e: RuntimeException) {
-            inFlight.decrementAndGet()
-            throw e
+            val createdEvent = paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
+            }
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
         return createdAt
     }
